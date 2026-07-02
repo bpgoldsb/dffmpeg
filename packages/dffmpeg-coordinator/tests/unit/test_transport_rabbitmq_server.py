@@ -92,3 +92,61 @@ async def test_rabbitmq_server_send_message_no_mark_sent():
 
     # Verify update_message_sent_at was NOT called when mark_sent=False
     app.state.db.messages.update_message_sent_at.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_rabbitmq_server_create_client_transport_active_connection():
+    app = MagicMock()
+    transport = RabbitMQServerTransport(app=app)
+
+    # Setup active connection
+    mock_conn = AsyncMock()
+    transport._manager.connection = mock_conn
+    transport._channel = AsyncMock()
+    transport._manager.is_connected.set()
+
+    client = transport.create_client_transport()
+
+    from dffmpeg.coordinator.transports.rabbitmq import RabbitMQProxyClientTransport
+
+    assert isinstance(client, RabbitMQProxyClientTransport)
+    assert client._server_transport == transport
+
+
+@pytest.mark.asyncio
+async def test_rabbitmq_server_create_client_transport_inactive_connection():
+    app = MagicMock()
+    transport = RabbitMQServerTransport(app=app)
+
+    # Ensure connection is cleared
+    transport._manager.connection = None
+    transport._manager.is_connected.clear()
+
+    client = transport.create_client_transport()
+
+    from dffmpeg.coordinator.transports.rabbitmq import RabbitMQProxyClientTransport
+
+    # Since multiplexing is enabled constantly by default, it should still return the proxy client
+    assert isinstance(client, RabbitMQProxyClientTransport)
+
+
+@pytest.mark.asyncio
+async def test_rabbitmq_proxy_client_connect_and_disconnect():
+    mock_server_transport = AsyncMock()
+    from dffmpeg.coordinator.transports.rabbitmq import RabbitMQProxyClientTransport
+
+    transport = RabbitMQProxyClientTransport(server_transport=mock_server_transport)
+
+    metadata = {
+        "exchange": "dffmpeg.workers",
+        "routing_key": "worker.1",
+        "queue_name": "dffmpeg.worker.1",
+    }
+
+    # Connect should register multiplexed client
+    await transport.connect(metadata)
+    mock_server_transport.register_multiplex_client.assert_called_once_with(transport)
+
+    # Disconnect should unregister multiplexed client
+    await transport.disconnect()
+    mock_server_transport.unregister_multiplex_client.assert_called_once_with(transport)

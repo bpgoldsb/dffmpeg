@@ -124,7 +124,10 @@ class RabbitMQClientTransport(BaseClientTransport):
             logger.error(f"RabbitMQ client setup failed: {e}")
             raise
         finally:
-            await self._manager.close()
+            try:
+                await asyncio.shield(self._manager.close())
+            except Exception as e:
+                logger.error(f"Error closing RabbitMQ manager in finally: {e}")
             self._channel = None
 
     async def disconnect(self):
@@ -134,12 +137,15 @@ class RabbitMQClientTransport(BaseClientTransport):
         if self._listen_task:
             self._listen_task.cancel()
             try:
-                await self._listen_task
+                await asyncio.shield(self._listen_task)
             except asyncio.CancelledError:
                 pass
             self._listen_task = None
 
-        await self._manager.close()
+        try:
+            await asyncio.shield(self._manager.close())
+        except Exception as e:
+            logger.error(f"Error closing RabbitMQ manager in disconnect: {e}")
 
     async def receive(self) -> BaseMessage:
         """Wait for and return the next message."""
