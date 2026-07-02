@@ -7,8 +7,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+### Fixed
+
+### Changed
+
+## [0.5.0] - 2026-07-02
+
 ### Upgrade Note
 - **HTTP Polling Backend Proxying**: The Coordinator can now proxy HTTP polling and streaming requests to an underlying RabbitMQ or MQTT broker. To utilize this, configure `backend_transport: "rabbitmq"` (or `"mqtt"`) under the coordinator's `http_polling` transport settings.
+- **Durable Queue Cleanup (RabbitMQ)**: If you are migrating a cluster where workers or clients previously connected directly to RabbitMQ to use this HTTP-polling-backed proxy setup, RabbitMQ may still have old, worker-specific durable queues bound to the exchanges (e.g., `dffmpeg.worker.{worker_id}`). Since the Coordinator now uses a single, coordinator-wide persistent queue and dynamic bindings, these old durable queues are no longer used and should be manually deleted from the RabbitMQ Management UI to prevent them from accumulating duplicate messages.
 
 ### Added
 - **Message-Bus Backed HTTP Polling Proxy**: Workers and clients can now benefit from central message bus scalability while communicating strictly via HTTP.
