@@ -22,11 +22,11 @@ class RequestSigner:
             payload = payload.encode()
         payload_hash = hashlib.sha256(payload).hexdigest()  # type: ignore
         canonical = f"{method.upper()}|{path}|{timestamp}|{payload_hash}"
-        logger.info(f"Signing canonical string: {canonical}")
+        logger.debug(f"Signing canonical string: {canonical}")
 
         hash = b64encode(hmac.new(self.secret, canonical.encode(), hashlib.sha256).digest()).decode("ascii")
 
-        logger.info(f"HMAC Signature: {hash}")
+        logger.debug(f"HMAC Signature: {hash}")
 
         return hash
 
@@ -53,7 +53,7 @@ class RequestSigner:
         # Compare
         result = hmac.compare_digest(expected, signature)
         if result:
-            logger.info("HMACs matched")
+            logger.debug("HMACs matched")
         else:
             logger.warning("HMACs do not match!")
 

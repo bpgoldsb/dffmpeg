@@ -1,4 +1,5 @@
 import asyncio
+import hashlib
 import logging
 from typing import Dict, Optional
 
@@ -29,6 +30,21 @@ logger = logging.getLogger(__name__)
 WORKER_VERSION = get_package_version("dffmpeg-worker")
 
 
+def _redact_secret(secret: Optional[str]) -> str:
+    """
+    Render a secret safe to log.
+
+    Returns a stable fingerprint rather than the value, so the log line keeps its
+    diagnostic use (telling two credentials apart, confirming one was loaded at all)
+    without putting the credential itself into the journal -- and from there into any
+    log shipper.
+    """
+    if not secret:
+        return "<unset>"
+    digest = hashlib.sha256(secret.encode()).hexdigest()[:8]
+    return f"<redacted sha256:{digest}>"
+
+
 class Worker:
     """
     Main worker coordinator class.
@@ -57,7 +73,9 @@ class Worker:
         self.transport_manager = WorkerTransportManager(config.transports)
         self.mount_manager = MountManager(config.mount_management)
 
-        logger.info(f"ClientID: {config.client_id} HMAC: {config.hmac_key}")
+        logger.info(
+            f"ClientID: {config.client_id} HMAC: {_redact_secret(config.hmac_key)}"
+        )
 
         self._running = False
         self._draining: bool = False
