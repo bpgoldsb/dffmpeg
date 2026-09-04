@@ -3,9 +3,12 @@ import asyncio
 import logging
 import os
 import sys
+from typing import Any, AsyncIterator, List, Optional, Tuple, Union
 
+import httpx
 from dffmpeg.client.api import DFFmpegClient
-from dffmpeg.client.config import load_config
+from dffmpeg.client.config import ClientConfig, load_config
+from dffmpeg.client.telemetry import heartbeat_loop_task, push_invocation_outcome
 from dffmpeg.common.cli_utils import (
     add_config_arg,
     add_job_id_arg,
@@ -21,7 +24,7 @@ from dffmpeg.common.formatting import (
     print_worker_details,
     print_worker_list,
 )
-from dffmpeg.common.models import JobLogsMessage, JobStatusMessage
+from dffmpeg.common.models import JobLogsMessage, JobRecord, JobStatusMessage
 from dffmpeg.common.paths import map_arguments, map_path
 from dffmpeg.common.version import get_package_version
 
@@ -29,16 +32,78 @@ from dffmpeg.common.version import get_package_version
 logging.basicConfig(level=logging.WARNING, format="%(message)s")
 logger = logging.getLogger(__name__)
 
+# The pinned, positively-identified fail-fast response shape the coordinator
+# returns for a job submission when zero workers are online (spec JXC-13,
+# interface contract with the concurrent coordinator work item). Matched
+# specifically -- not folded into the generic non-2xx/unreachable case -- so
+# it can be told apart in logs/telemetry, per JXC-5's "no worker online" as
+# its own named pre-output failure category.
+NO_WORKERS_ONLINE_STATUS = 503
+NO_WORKERS_ONLINE_ERROR_CODE = "no_workers_online"
 
-async def stream_and_wait(client: DFFmpegClient, job_id: str, transport: str, metadata: dict) -> int:
+
+class PreOutputFailure(Exception):
+    """
+    Raised internally by the proxy (dffmpeg_proxy) path to signal that a
+    dffmpeg job failed before producing any output, and should fall back to
+    the local ffmpeg binary for this invocation (spec JXC-5). `reason` is a
+    short machine-readable tag used for logging and fallback telemetry.
+
+    Never raised by the `dffmpeg-client` CLI's own submit/status/etc.
+    subcommands -- those keep their existing plain-exit-code behavior.
+    """
+
+    def __init__(self, reason: str):
+        self.reason = reason
+        super().__init__(reason)
+
+
+def _is_no_workers_online(exc: httpx.HTTPStatusError) -> bool:
+    """
+    Positively matches the coordinator's pinned fail-fast response for "zero
+    workers online" (HTTP 503, body `{"error": "no_workers_online", ...}`).
+    """
+    resp = exc.response
+    if resp.status_code != NO_WORKERS_ONLINE_STATUS:
+        return False
+    try:
+        body = resp.json()
+    except ValueError:
+        return False
+    return isinstance(body, dict) and body.get("error") == NO_WORKERS_ONLINE_ERROR_CODE
+
+
+async def stream_and_wait(
+    client: DFFmpegClient,
+    job_id: str,
+    transport: str,
+    metadata: dict,
+    first_message: Optional[Union[JobLogsMessage, JobStatusMessage]] = None,
+    agen: Optional[AsyncIterator[Union[JobLogsMessage, JobStatusMessage]]] = None,
+) -> int:
     """
     Streams logs and status for a job, waiting for completion.
     Returns exit code (0 for success, 1 for failure/cancellation).
+
+    `first_message` / `agen`: used by the dffmpeg_proxy fallback path, which
+    already peeked the first message off `client.stream_job(...)` (bounded by
+    the coordinator request timeout, spec JXC-14) before deciding to stream
+    normally. When given, that message is replayed and the SAME generator
+    object is resumed, rather than opening a second one.
     """
     exit_code = 1
 
+    if agen is None:
+        agen = client.stream_job(job_id, transport, metadata)
+
+    async def _iter_with_first() -> AsyncIterator[Union[JobLogsMessage, JobStatusMessage]]:
+        if first_message is not None:
+            yield first_message
+        async for m in agen:  # type: ignore[union-attr]
+            yield m
+
     try:
-        async for message in client.stream_job(job_id, transport, metadata):
+        async for message in _iter_with_first():
             if isinstance(message, JobLogsMessage):
                 for log in message.payload.logs:
                     stream = sys.stdout if log.stream == "stdout" else sys.stderr
@@ -67,6 +132,157 @@ async def stream_and_wait(client: DFFmpegClient, job_id: str, transport: str, me
         raise
 
     return exit_code
+
+
+def _prepare_job_submission(client: DFFmpegClient, job_args: List[str]) -> Tuple[List[str], List[str], Optional[str]]:
+    """
+    Shared argument/path-mapping prep used by both `job_submit` (the `submit`
+    CLI subcommand) and the dffmpeg_proxy fallback-aware path below.
+    """
+    processed_job_args, paths = map_arguments(job_args, client.config.paths)
+
+    cwd = os.getcwd()
+    mapped_cwd, used_cwd_var = map_path(cwd, client.config.paths)
+    if used_cwd_var and used_cwd_var not in paths:
+        paths.append(used_cwd_var)
+
+    return processed_job_args, paths, mapped_cwd
+
+
+async def _submit_and_await_first_signal(
+    client: DFFmpegClient,
+    binary_name: str,
+    job_args: List[str],
+    coordinator_request_timeout: float,
+) -> Tuple[JobRecord, Optional[Union[JobLogsMessage, JobStatusMessage]], AsyncIterator[Any]]:
+    """
+    Submits a job and waits -- bounded by `coordinator_request_timeout` -- for
+    the coordinator/worker to show any sign of life (the first status/log
+    message on the job's stream). Everything in here that fails is
+    classified as a pre-output failure (spec JXC-5) and raised as
+    `PreOutputFailure`, maximally tolerant of anything unexpected: an
+    unrecognized non-2xx coordinator response, a connection failure, or the
+    timeout elapsing with no response at all (spec JXC-14 -- this is what
+    catches a worker that's registered `online` but wedged, since `online`
+    only reflects a heartbeat, not execution liveness).
+
+    Returns (job, first_message, agen) on success -- `first_message` may be
+    None if the stream ended with zero messages (also unusual enough to be
+    worth surfacing, but here it's simply passed through so the caller can
+    keep streaming normally).
+    """
+    try:
+        processed_job_args, paths, mapped_cwd = _prepare_job_submission(client, job_args)
+
+        try:
+            job = await asyncio.wait_for(
+                client.submit_job(
+                    binary_name,
+                    processed_job_args,
+                    paths,
+                    working_directory=mapped_cwd,
+                    monitor=True,
+                    heartbeat_interval=client.config.job_heartbeat_interval,
+                ),
+                timeout=coordinator_request_timeout,
+            )
+        except asyncio.TimeoutError:
+            raise PreOutputFailure("coordinator_timeout_on_submit") from None
+        except httpx.HTTPStatusError as e:
+            if _is_no_workers_online(e):
+                raise PreOutputFailure(NO_WORKERS_ONLINE_ERROR_CODE) from e
+            # Tolerant of any other/unrecognized non-2xx shape -- still a
+            # positively-classified pre-output failure, never left unhandled.
+            raise PreOutputFailure(f"coordinator_http_error_{e.response.status_code}") from e
+        except httpx.HTTPError as e:
+            raise PreOutputFailure(f"coordinator_unreachable:{type(e).__name__}") from e
+
+        await client._start_heartbeat_loop(str(job.job_id), job.heartbeat_interval)
+
+        agen = client.stream_job(str(job.job_id), job.transport, job.transport_metadata)
+        try:
+            first_message = await asyncio.wait_for(agen.__anext__(), timeout=coordinator_request_timeout)
+        except asyncio.TimeoutError:
+            # Coordinator accepted the job (possibly even assigned a worker
+            # that reported `online`) but nothing at all came back -- the
+            # "wedged worker" case this timeout exists for (JXC-14).
+            raise PreOutputFailure("coordinator_timeout_no_execution_signal") from None
+        except StopAsyncIteration:
+            # Stream ended immediately with no messages at all -- treat the
+            # same as "never showed any sign of life".
+            raise PreOutputFailure("no_execution_signal") from None
+
+        return job, first_message, agen
+
+    except PreOutputFailure:
+        raise
+    except asyncio.CancelledError:
+        raise
+    except Exception as e:
+        # Maximally tolerant: anything unanticipated before we've seen a
+        # single message from the job is still, by definition, pre-output.
+        raise PreOutputFailure(f"unexpected_error:{type(e).__name__}") from e
+
+
+async def _run_dffmpeg_job(client: DFFmpegClient, config: ClientConfig, binary_name: str, job_args: List[str]) -> int:
+    """
+    Runs one dffmpeg job end-to-end for the proxy path: submit, wait (bounded)
+    for the first sign of execution, then stream to completion while pushing
+    a periodic heartbeat (JXC-15) in the background. Raises `PreOutputFailure`
+    if the job never gets past the pre-output stage (JXC-5); any failure
+    after that point is a normal (non-fallback, mid-stream -- out of scope
+    per JXC-6) exit code, same as it always was.
+    """
+    job, first_message, agen = await _submit_and_await_first_signal(
+        client, binary_name, job_args, config.coordinator_request_timeout
+    )
+
+    hb_task = asyncio.create_task(heartbeat_loop_task(config, config.telemetry_heartbeat_interval))
+    try:
+        return await stream_and_wait(
+            client,
+            str(job.job_id),
+            job.transport,
+            job.transport_metadata,
+            first_message=first_message,
+            agen=agen,
+        )
+    finally:
+        hb_task.cancel()
+        try:
+            await hb_task
+        except asyncio.CancelledError:
+            pass
+
+
+def _push_telemetry_sync(config: ClientConfig, path: str, reason: Optional[str] = None) -> None:
+    """
+    Runs a telemetry push to completion from sync code (proxy_main's tail,
+    right before exec/sys.exit -- no event loop is running at that point).
+    Bounded by config.telemetry_timeout inside push_invocation_outcome/_push;
+    the extra try/except here is defense-in-depth so telemetry genuinely can
+    never block or fail the exec (spec JXC-8), no matter what.
+    """
+    try:
+        asyncio.run(push_invocation_outcome(config, path=path, reason=reason))
+    except Exception:
+        logger.debug("Telemetry push failed", exc_info=True)
+
+
+def _exec_local(config: ClientConfig, job_args: List[str]) -> None:
+    """
+    Replaces the current process image with the local jellyfin-ffmpeg binary,
+    passing argv through unchanged -- mirrors the calling wrapper script's own
+    exec-only error-handling model (no trap, no retry): whatever exit code
+    the local binary returns becomes this process's exit code. Never returns
+    on success.
+    """
+    local_path = config.local_ffmpeg_path
+    try:
+        os.execv(local_path, [local_path] + list(job_args))
+    except OSError as e:
+        logger.error(f"Failed to exec local ffmpeg at {local_path}: {e}")
+        sys.exit(1)
 
 
 async def job_submit(client: DFFmpegClient, args: argparse.Namespace) -> int:
@@ -299,23 +515,25 @@ def main():
 def proxy_main():
     """
     Entry point for proxy scripts (e.g. 'ffmpeg').
+
+    Decides local-vs-dffmpeg *before attempting anything* (spec JXC-1/JXC-2):
+    dffmpeg is the default path; the `failsafe_force_local` key in the same
+    dffmpeg-client.yaml this proxy already re-reads on every invocation (see
+    config.load_config / R2) forces local, unconditionally, with no dffmpeg
+    attempt at all. This logic lives here rather than in the calling wrapper
+    script on purpose -- that script has zero error handling and every branch
+    ends in a bare `exec`.
+
+    On the dffmpeg path, a pre-output failure (coordinator unreachable, no
+    worker online, or the coordinator request timing out -- spec JXC-5,
+    JXC-13, JXC-14) falls back to the local binary for this same invocation,
+    after firing a fire-and-forget telemetry push that can never block or
+    fail the exec (spec JXC-8). A failure that happens after the job has
+    already shown signs of execution (mid-stream) is out of scope (JXC-6) and
+    is returned as a normal exit code, exactly as before this change.
     """
     binary_name: str = os.path.basename(sys.argv[0])
     job_args = sys.argv[1:]
-
-    # Construct args to mimic 'submit' command
-    # We can reuse job_submit logic but we need to mock the args namespace
-    # Or just call run_submit logic directly if we kept it separate.
-    # But now job_submit expects (client, args).
-
-    # Let's reconstruct a namespace
-    args = argparse.Namespace(
-        binary=binary_name,
-        arguments=job_args,
-        detach=False,
-        heartbeat_interval=None,
-        config=None,
-    )
 
     try:
         config = load_config(None)
@@ -323,14 +541,42 @@ def proxy_main():
         logger.error(f"Configuration error: {e}")
         sys.exit(1)
 
-    async def run():
+    if config.failsafe_force_local:
+        logger.warning("dffmpeg failsafe (failsafe_force_local) is set; routing directly to local ffmpeg")
+        _push_telemetry_sync(config, path="local_failsafe")
+        _exec_local(config, job_args)
+        return  # pragma: no cover - _exec_local never returns on success
+
+    async def run() -> Tuple[str, Any]:
         async with DFFmpegClient(config) as client:
-            return await job_submit(client, args)
+            try:
+                exit_code = await _run_dffmpeg_job(client, config, binary_name, job_args)
+                return "ok", exit_code
+            except PreOutputFailure as e:
+                return "fallback", e.reason
+            except asyncio.CancelledError:
+                raise
+            except Exception as e:
+                # Anything past this point already saw at least one message
+                # from the job (i.e. it's mid-stream, JXC-6 non-goal) -- no
+                # fallback, just the same plain-failure behavior every other
+                # subcommand here has always had.
+                logger.error(f"Unhandled error during dffmpeg job: {e}")
+                return "ok", 1
 
     try:
-        sys.exit(asyncio.run(run()))
+        outcome, payload = asyncio.run(run())
     except KeyboardInterrupt:
         sys.exit(130)
+
+    if outcome == "fallback":
+        logger.warning(f"dffmpeg pre-output failure ({payload}); falling back to local ffmpeg")
+        _push_telemetry_sync(config, path="local_fallback", reason=payload)
+        _exec_local(config, job_args)
+        return  # pragma: no cover - _exec_local never returns on success
+
+    _push_telemetry_sync(config, path="dffmpeg")
+    sys.exit(payload)
 
 
 if __name__ == "__main__":
