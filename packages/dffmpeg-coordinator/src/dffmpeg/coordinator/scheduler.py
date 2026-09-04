@@ -17,6 +17,25 @@ from dffmpeg.coordinator.transports import TransportManager
 logger = getLogger(__name__)
 
 
+async def has_online_workers(worker_repo: WorkerRepository) -> bool:
+    """
+    Check whether at least one worker is currently online.
+
+    Used by the job submission route (JXC-13) to reject a submission
+    immediately when the worker pool is empty, rather than accepting the
+    job and leaving it stuck in `pending` until a worker eventually shows
+    up (or never does).
+
+    Args:
+        worker_repo (WorkerRepository): Repository for accessing worker data.
+
+    Returns:
+        bool: True if at least one worker has status "online".
+    """
+    online_workers = await worker_repo.get_workers_by_status("online")
+    return bool(online_workers)
+
+
 async def process_job_assignment(
     job_id: ULID,
     job_repo: JobRepository,

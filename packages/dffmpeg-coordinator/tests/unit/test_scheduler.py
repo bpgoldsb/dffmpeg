@@ -4,7 +4,7 @@ import pytest
 from ulid import ULID
 
 from dffmpeg.common.models import JobRecord, JobRequestMessage, JobStatusMessage, WorkerRecord
-from dffmpeg.coordinator.scheduler import process_job_assignment
+from dffmpeg.coordinator.scheduler import has_online_workers, process_job_assignment
 
 
 @pytest.fixture
@@ -20,6 +20,31 @@ def worker_repo():
 @pytest.fixture
 def transports():
     return AsyncMock()
+
+
+@pytest.mark.anyio
+async def test_has_online_workers_true(worker_repo):
+    worker = WorkerRecord(
+        worker_id="w1",
+        status="online",
+        binaries=["ffmpeg"],
+        paths=["/data"],
+        transport="http_polling",
+        transport_metadata={},
+        registration_interval=60,
+    )
+    worker_repo.get_workers_by_status.return_value = [worker]
+
+    assert await has_online_workers(worker_repo) is True
+    worker_repo.get_workers_by_status.assert_called_once_with("online")
+
+
+@pytest.mark.anyio
+async def test_has_online_workers_false_when_empty(worker_repo):
+    worker_repo.get_workers_by_status.return_value = []
+
+    assert await has_online_workers(worker_repo) is False
+    worker_repo.get_workers_by_status.assert_called_once_with("online")
 
 
 @pytest.mark.anyio
