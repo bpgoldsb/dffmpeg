@@ -3,6 +3,7 @@ from logging import getLogger
 from typing import List, Optional
 
 from fastapi import APIRouter, BackgroundTasks, Depends, HTTPException
+from fastapi.responses import JSONResponse
 from ulid import ULID
 
 from dffmpeg.common.models import (
@@ -31,7 +32,7 @@ from dffmpeg.coordinator.config import CoordinatorConfig
 from dffmpeg.coordinator.db.jobs import JobRepository
 from dffmpeg.coordinator.db.messages import MessageRepository
 from dffmpeg.coordinator.db.workers import WorkerRepository
-from dffmpeg.coordinator.scheduler import process_job_assignment
+from dffmpeg.coordinator.scheduler import has_online_workers, process_job_assignment
 from dffmpeg.coordinator.transports import TransportManager
 
 router = APIRouter()
@@ -66,9 +67,27 @@ async def job_submit(
 
     Raises:
         HTTPException: If no supported transports are available or binary is not allowed.
+
+    Note:
+        If no workers are currently online, the submission is rejected immediately
+        (JXC-13) with an HTTP 503 and a `{"error": "no_workers_online", "detail": ...}`
+        body, rather than being accepted and left stuck in `pending`. This is returned
+        as a plain JSONResponse (not HTTPException) so the body is a flat object rather
+        than being nested under FastAPI's default `{"detail": ...}` envelope -- the
+        client-side proxy classifies on this exact shape.
     """
     if payload.binary_name not in config.allowed_binaries:
         raise HTTPException(status_code=400, detail=f"Unsupported binary name: {payload.binary_name}")
+
+    if not await has_online_workers(worker_repo):
+        logger.warning(f"Rejecting job submission from {identity.client_id}: no workers online")
+        return JSONResponse(
+            status_code=503,
+            content={
+                "error": "no_workers_online",
+                "detail": "No dffmpeg workers are currently online to process this job.",
+            },
+        )
 
     try:
         healthy_transports = await transports.get_healthy_transports()
