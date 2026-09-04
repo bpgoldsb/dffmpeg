@@ -9,7 +9,7 @@ from dffmpeg.coordinator.api.routes.job import process_job_assignment
 
 
 @pytest.mark.anyio
-async def test_job_submission_interaction(test_app, sign_request, create_auth_identity):
+async def test_job_submission_interaction(test_app, sign_request, create_auth_identity, create_worker_record):
     """
     Test that a client can submit a job.
     """
@@ -19,6 +19,9 @@ async def test_job_submission_interaction(test_app, sign_request, create_auth_id
 
     async with test_app.router.lifespan_context(test_app):
         await create_auth_identity(test_app, client_id, "client", client_key)
+        # An online worker must exist, otherwise submission is fail-fast rejected (JXC-13).
+        await create_auth_identity(test_app, "worker01", "worker", RequestSigner.generate_key())
+        await create_worker_record(test_app, "worker01")
 
         transport = ASGITransport(app=test_app)
         async with AsyncClient(transport=transport, base_url="http://test") as client:
@@ -40,9 +43,11 @@ async def test_job_submission_interaction(test_app, sign_request, create_auth_id
             job_id = ULID.from_str(job_resp["job_id"])
 
             # Verify: DB Updated
+            # (An online worker is present so the background assignment task may have
+            # already run by the time we check -- either state is a valid outcome here.)
             job = await test_app.state.db.jobs.get_job(job_id)
             assert job is not None
-            assert job.status == "pending"
+            assert job.status in ["pending", "assigned"]
             assert job.requester_id == client_id
 
 
@@ -451,3 +456,112 @@ async def test_invalid_job_transitions(test_app, sign_request, create_auth_ident
             headers = await sign_request(worker_signer, worker_id, "POST", path, body_str)
             resp = await client.post(path, content=body_str, headers=headers)
             assert resp.status_code == 404
+
+
+@pytest.mark.anyio
+async def test_job_submission_fails_fast_with_no_online_workers(test_app, sign_request, create_auth_identity):
+    """
+    JXC-13: a job submitted while zero workers are online is rejected immediately
+    with HTTP 503 and a flat {"error": "no_workers_online", "detail": ...} body --
+    the pinned contract the client-side fallback patch classifies on -- rather than
+    being accepted and left pending indefinitely.
+    """
+    client_id = "client01"
+    client_key = RequestSigner.generate_key()
+    client_signer = RequestSigner(client_key)
+
+    async with test_app.router.lifespan_context(test_app):
+        await create_auth_identity(test_app, client_id, "client", client_key)
+        # Deliberately no worker identity/record created -- zero online workers.
+
+        transport = ASGITransport(app=test_app)
+        async with AsyncClient(transport=transport, base_url="http://test") as client:
+            path = "/jobs/submit"
+            body = {
+                "binary_name": "ffmpeg",
+                "arguments": ["-version"],
+                "paths": [],
+                "supported_transports": ["http_polling"],
+            }
+            body_str = json.dumps(body)
+            headers = await sign_request(client_signer, client_id, "POST", path, body_str)
+
+            resp = await client.post(path, content=body_str, headers=headers)
+
+            assert resp.status_code == 503
+            assert resp.json() == {
+                "error": "no_workers_online",
+                "detail": "No dffmpeg workers are currently online to process this job.",
+            }
+
+            # No job should have been created at all.
+            jobs = await test_app.state.db.jobs.get_dashboard_jobs(requester_id=client_id)
+            assert jobs == []
+
+
+@pytest.mark.anyio
+async def test_job_submission_fails_fast_when_only_offline_workers_exist(
+    test_app, sign_request, create_auth_identity, create_worker_record
+):
+    """
+    JXC-13: an offline (or registering/draining) worker identity does not count as
+    'online' -- the coordinator must still reject the submission.
+    """
+    client_id = "client01"
+    client_key = RequestSigner.generate_key()
+    client_signer = RequestSigner(client_key)
+
+    async with test_app.router.lifespan_context(test_app):
+        await create_auth_identity(test_app, client_id, "client", client_key)
+        await create_auth_identity(test_app, "worker01", "worker", RequestSigner.generate_key())
+        await create_worker_record(test_app, "worker01", status="offline")
+
+        transport = ASGITransport(app=test_app)
+        async with AsyncClient(transport=transport, base_url="http://test") as client:
+            path = "/jobs/submit"
+            body = {
+                "binary_name": "ffmpeg",
+                "arguments": ["-version"],
+                "paths": [],
+                "supported_transports": ["http_polling"],
+            }
+            body_str = json.dumps(body)
+            headers = await sign_request(client_signer, client_id, "POST", path, body_str)
+
+            resp = await client.post(path, content=body_str, headers=headers)
+
+            assert resp.status_code == 503
+            assert resp.json()["error"] == "no_workers_online"
+
+
+@pytest.mark.anyio
+async def test_job_submission_succeeds_with_one_online_worker(
+    test_app, sign_request, create_auth_identity, create_worker_record
+):
+    """
+    JXC-13 must not false-positive: a single online worker is enough to accept
+    the submission normally (this is also covered end-to-end by test_smoke.py).
+    """
+    client_id = "client01"
+    client_key = RequestSigner.generate_key()
+    client_signer = RequestSigner(client_key)
+
+    async with test_app.router.lifespan_context(test_app):
+        await create_auth_identity(test_app, client_id, "client", client_key)
+        await create_auth_identity(test_app, "worker01", "worker", RequestSigner.generate_key())
+        await create_worker_record(test_app, "worker01", status="online")
+
+        transport = ASGITransport(app=test_app)
+        async with AsyncClient(transport=transport, base_url="http://test") as client:
+            path = "/jobs/submit"
+            body = {
+                "binary_name": "ffmpeg",
+                "arguments": ["-version"],
+                "paths": [],
+                "supported_transports": ["http_polling"],
+            }
+            body_str = json.dumps(body)
+            headers = await sign_request(client_signer, client_id, "POST", path, body_str)
+
+            resp = await client.post(path, content=body_str, headers=headers)
+            assert resp.status_code == 200
