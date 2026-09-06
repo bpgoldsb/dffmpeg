@@ -25,6 +25,13 @@ PROMETHEUS_CONTENT_TYPE = "text/plain; version=0.0.4; charset=utf-8"
 
 _WINDOWS = ("current", "last_1m", "last_5m")
 
+# Windows rendered for the success-only (`job.status == "completed"`) family below.
+# Deliberately excludes "current": a completed job is by definition no longer
+# current (`is_current = not is_terminal`), so a "current" window on a
+# completed-only family would be a permanently-zero series -- worse than no
+# series at all, since a future `== 0` alert on it would fire forever.
+_SUCCESS_WINDOWS = ("last_1m", "last_5m")
+
 
 def _escape_label_value(value: str) -> str:
     """Escape a label value per the Prometheus text exposition format."""
@@ -148,6 +155,20 @@ async def get_metrics(
             if is_5m:
                 metrics.per_worker[w].last_5m += 1
 
+        # Tally successes (job.status == "completed"), keyed on job.last_update --
+        # which, for a job that reached "completed", IS its completion time
+        # (update_status writes last_update alongside status on every transition).
+        # Keying on last_update (not created_at) matters: get_recent_jobs bounds
+        # its candidate set on last_update, so a long-running job that finished
+        # seconds ago but was created >5m ago is still in `jobs` above -- bucketing
+        # on created_at would make it uncountable here. `current` is never set;
+        # see _SUCCESS_WINDOWS.
+        if job.status == "completed":
+            if job_time >= cutoff_1m:
+                metrics.succeeded.last_1m += 1
+            if job_time >= cutoff_5m:
+                metrics.succeeded.last_5m += 1
+
     # 4. Online-worker count (JXC-10) -- sourced from worker_repo, NOT from the
     # per_worker job-throughput buckets above, which are identity-seeded and carry
     # no online/offline signal (research R4/R5/R23).
@@ -170,6 +191,18 @@ async def get_metrics(
             "Job counts over a trailing time window, across all binaries and workers.",
             "gauge",
             [({"window": window}, getattr(metrics.total, window)) for window in _WINDOWS],
+        )
+    )
+
+    lines.extend(
+        _render_metric_family(
+            "dffmpeg_jobs_succeeded",
+            "Count of jobs that reached status=completed, bucketed by the trailing "
+            "window in which their last_update (== completion time) falls. No "
+            "'current' window is emitted -- a completed job is never current, so "
+            "that series would be permanently zero.",
+            "gauge",
+            [({"window": window}, getattr(metrics.succeeded, window)) for window in _SUCCESS_WINDOWS],
         )
     )
 

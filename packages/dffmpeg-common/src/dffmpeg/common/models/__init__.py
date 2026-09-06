@@ -384,6 +384,11 @@ class JobMetricsResponse(BaseModel):
     total: MetricCounts
     per_binary: Dict[str, MetricCounts]
     per_worker: Dict[str, MetricCounts]
+    # Success-only tally (job.status == "completed"), keyed on job.last_update.
+    # Only `last_1m`/`last_5m` are ever populated -- `current` is intentionally left
+    # at its default of 0 and never rendered, since a "completed" job is by
+    # definition no longer current (see metrics.py for the rationale).
+    succeeded: MetricCounts = Field(default_factory=MetricCounts)
 
 
 class JanitorActionRequest(BaseModel):
