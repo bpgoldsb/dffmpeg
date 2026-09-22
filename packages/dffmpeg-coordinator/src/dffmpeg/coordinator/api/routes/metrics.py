@@ -100,6 +100,7 @@ async def get_metrics(
         total=MetricCounts(),
         per_binary={b: MetricCounts() for b in binaries},
         per_worker={w: MetricCounts() for w in worker_ids},
+        duration_seconds_sum={window: 0.0 for window in _SUCCESS_WINDOWS},
     )
 
     # 2. Get recent jobs (last 5 minutes = 300 seconds)
@@ -169,6 +170,19 @@ async def get_metrics(
             if job_time >= cutoff_5m:
                 metrics.succeeded.last_5m += 1
 
+            # Per-job duration (last_update - created_at, seconds), summed into
+            # the same windows as the success tally above. created_at is
+            # non-optional on Job (always set at submission time); last_update
+            # is guarded because job_time already treats a missing one as 0,
+            # which would otherwise inflate this sum with a bogus negative-ish
+            # duration.
+            if job.last_update is not None:
+                duration_seconds = (job.last_update - job.created_at).total_seconds()
+                if job_time >= cutoff_1m:
+                    metrics.duration_seconds_sum["last_1m"] += duration_seconds
+                if job_time >= cutoff_5m:
+                    metrics.duration_seconds_sum["last_5m"] += duration_seconds
+
     # 4. Online-worker count (JXC-10) -- sourced from worker_repo, NOT from the
     # per_worker job-throughput buckets above, which are identity-seeded and carry
     # no online/offline signal (research R4/R5/R23).
@@ -203,6 +217,21 @@ async def get_metrics(
             "that series would be permanently zero.",
             "gauge",
             [({"window": window}, getattr(metrics.succeeded, window)) for window in _SUCCESS_WINDOWS],
+        )
+    )
+
+    lines.extend(
+        _render_metric_family(
+            "dffmpeg_job_duration_seconds_sum",
+            "Sum of per-job duration (last_update - created_at, in seconds) for "
+            "jobs that reached status=completed, bucketed by the trailing window "
+            "in which their last_update (== completion time) falls. Divide by "
+            "the matching dffmpeg_jobs_succeeded{window=...} sample for mean job "
+            "duration -- no paired count series is emitted since that one "
+            "already exists. No 'current' window, same reasoning as "
+            "dffmpeg_jobs_succeeded.",
+            "gauge",
+            [({"window": window}, metrics.duration_seconds_sum[window]) for window in _SUCCESS_WINDOWS],
         )
     )
 
