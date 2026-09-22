@@ -459,6 +459,13 @@ class JobMetricsResponse(BaseModel):
     # at its default of 0 and never rendered, since a "completed" job is by
     # definition no longer current (see metrics.py for the rationale).
     succeeded: MetricCounts = Field(default_factory=MetricCounts)
+    # Sum of per-job duration (last_update - created_at, seconds) for jobs that
+    # reached status=completed, keyed the same way as `succeeded` above (window ->
+    # sum). Only "last_1m"/"last_5m" keys are ever populated, for the same reason
+    # `succeeded` excludes "current". No paired count series is needed -- divide
+    # this by the matching `succeeded.last_1m`/`succeeded.last_5m` for mean job
+    # duration (see metrics.py).
+    duration_seconds_sum: Dict[str, float] = Field(default_factory=dict)
 
 
 class JanitorActionRequest(BaseModel):

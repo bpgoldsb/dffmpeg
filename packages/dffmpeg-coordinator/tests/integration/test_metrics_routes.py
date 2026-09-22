@@ -81,6 +81,12 @@ def test_metrics_endpoint_allowed(tmp_path):
         assert 'dffmpeg_jobs_succeeded{window="last_5m"} 0' in body
         assert 'dffmpeg_jobs_succeeded{window="current"}' not in body
 
+        # dffmpeg_job_duration_seconds_sum: same window shape as _succeeded.
+        assert "# TYPE dffmpeg_job_duration_seconds_sum gauge" in body
+        assert 'dffmpeg_job_duration_seconds_sum{window="last_1m"} 0.0' in body
+        assert 'dffmpeg_job_duration_seconds_sum{window="last_5m"} 0.0' in body
+        assert 'dffmpeg_job_duration_seconds_sum{window="current"}' not in body
+
 
 def test_metrics_endpoint_forbidden(tmp_path):
     config = get_test_config(True, str(tmp_path / "test.db"))
@@ -213,6 +219,73 @@ async def test_metrics_succeeded_keyed_on_last_update_not_created_at(test_app):
             assert 'dffmpeg_jobs_succeeded{window="last_5m"} 1' in body
             # It completed <1m ago, so it also lands in last_1m.
             assert 'dffmpeg_jobs_succeeded{window="last_1m"} 1' in body
+
+
+@pytest.mark.anyio
+async def test_metrics_duration_sums_completed_job(test_app):
+    """A completed job's duration (last_update - created_at) is summed into both
+    windows, alongside the existing success count."""
+    async with test_app.router.lifespan_context(test_app):
+        now = datetime.now(timezone.utc)
+        await _insert_job(
+            test_app,
+            status="completed",
+            created_at=now - timedelta(seconds=30),
+            last_update=now - timedelta(seconds=10),
+        )
+
+        transport = ASGITransport(app=test_app)
+        async with AsyncClient(transport=transport, base_url="http://test") as client:
+            response = await client.get("/metrics", headers={"X-Forwarded-For": "127.0.0.1"})
+            assert response.status_code == 200
+            body = response.text
+            assert 'dffmpeg_job_duration_seconds_sum{window="last_1m"} 20.0' in body
+            assert 'dffmpeg_job_duration_seconds_sum{window="last_5m"} 20.0' in body
+
+
+@pytest.mark.anyio
+async def test_metrics_duration_excludes_failed_job(test_app):
+    """A failed job contributes to neither the success count nor the duration
+    sum, even though it is still visible in the general-purpose family."""
+    async with test_app.router.lifespan_context(test_app):
+        now = datetime.now(timezone.utc)
+        await _insert_job(
+            test_app,
+            status="failed",
+            created_at=now - timedelta(seconds=30),
+            last_update=now - timedelta(seconds=10),
+        )
+
+        transport = ASGITransport(app=test_app)
+        async with AsyncClient(transport=transport, base_url="http://test") as client:
+            response = await client.get("/metrics", headers={"X-Forwarded-For": "127.0.0.1"})
+            assert response.status_code == 200
+            body = response.text
+            assert 'dffmpeg_job_duration_seconds_sum{window="last_1m"} 0.0' in body
+            assert 'dffmpeg_job_duration_seconds_sum{window="last_5m"} 0.0' in body
+
+
+@pytest.mark.anyio
+async def test_metrics_duration_keyed_on_last_update_not_created_at(test_app):
+    """Same last_update-bucketing rule as dffmpeg_jobs_succeeded: a job created
+    10 minutes ago but completed 30s ago still lands in both windows, with its
+    full (created_at -> last_update) duration -- not clipped to the window."""
+    async with test_app.router.lifespan_context(test_app):
+        now = datetime.now(timezone.utc)
+        await _insert_job(
+            test_app,
+            status="completed",
+            created_at=now - timedelta(minutes=10),
+            last_update=now - timedelta(seconds=30),
+        )
+
+        transport = ASGITransport(app=test_app)
+        async with AsyncClient(transport=transport, base_url="http://test") as client:
+            response = await client.get("/metrics", headers={"X-Forwarded-For": "127.0.0.1"})
+            assert response.status_code == 200
+            body = response.text
+            assert 'dffmpeg_job_duration_seconds_sum{window="last_5m"} 570.0' in body
+            assert 'dffmpeg_job_duration_seconds_sum{window="last_1m"} 570.0' in body
 
 
 @pytest.mark.anyio
