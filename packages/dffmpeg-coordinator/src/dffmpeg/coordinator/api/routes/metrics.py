@@ -96,10 +96,16 @@ async def get_metrics(
     all_clients = await auth_repo.list_identities()
     worker_ids = [w.client_id for w in all_clients if w.role == "worker"]
 
+    # Terminal statuses a job can end in -- defined up front (not just before the
+    # tally loop) because it also seeds per_status below, the same way `binaries`/
+    # `worker_ids` seed per_binary/per_worker.
+    terminal_statuses = {"completed", "failed", "canceled"}
+
     metrics = JobMetricsResponse(
         total=MetricCounts(),
         per_binary={b: MetricCounts() for b in binaries},
         per_worker={w: MetricCounts() for w in worker_ids},
+        per_status={s: MetricCounts() for s in terminal_statuses},
         duration_seconds_sum={window: 0.0 for window in _SUCCESS_WINDOWS},
     )
 
@@ -108,8 +114,6 @@ async def get_metrics(
     now = datetime.now(timezone.utc)
     cutoff_1m = now.timestamp() - 60
     cutoff_5m = now.timestamp() - 300
-
-    terminal_statuses = {"completed", "failed", "canceled"}
 
     # 3. In-memory tally
     for job in jobs:
@@ -155,6 +159,23 @@ async def get_metrics(
                 metrics.per_worker[w].last_1m += 1
             if is_5m:
                 metrics.per_worker[w].last_5m += 1
+
+        # Tally per (terminal) status. A non-terminal job (pending/assigned/
+        # running/canceling) contributes to none of these keys -- only the three
+        # seeded above are ever populated, so `dffmpeg_jobs_by_status` never grows
+        # an unbounded label set. `is_current` is included for structural parity
+        # with the per_binary/per_worker blocks above, but it is always False
+        # here: is_current == not is_terminal, and this branch only runs when
+        # job.status IS terminal, so every status="..." ,window="current" sample
+        # in the rendered family is permanently 0 -- expected, not a bug.
+        if job.status in terminal_statuses:
+            s = job.status
+            if is_current:
+                metrics.per_status[s].current += 1
+            if is_1m:
+                metrics.per_status[s].last_1m += 1
+            if is_5m:
+                metrics.per_status[s].last_5m += 1
 
         # Tally successes (job.status == "completed"), keyed on job.last_update --
         # which, for a job that reached "completed", IS its completion time
@@ -258,6 +279,29 @@ async def get_metrics(
             [
                 ({"worker": worker, "window": window}, getattr(counts, window))
                 for worker, counts in metrics.per_worker.items()
+                for window in _WINDOWS
+            ],
+        )
+    )
+
+    lines.extend(
+        _render_metric_family(
+            "dffmpeg_jobs_by_status",
+            "Job counts over a trailing time window, broken down by terminal status "
+            "(completed/failed/canceled -- see terminal_statuses). Lets an alert "
+            "distinguish a worker whose jobs are being canceled (client-driven, "
+            "healthy) from one whose jobs are failing (broken) -- neither is visible "
+            "in dffmpeg_jobs_succeeded, which only tracks status=completed. All "
+            "three statuses always render, zero-valued if unseen, same as "
+            "dffmpeg_jobs_by_binary/_by_worker. The 'current' window is always 0 "
+            "for every status here: reaching one of these three IS what makes a job "
+            "non-current, so that sample can never be nonzero -- it is rendered "
+            "anyway only to keep the window set identical to the other by-X "
+            "families above.",
+            "gauge",
+            [
+                ({"status": status, "window": window}, getattr(counts, window))
+                for status, counts in metrics.per_status.items()
                 for window in _WINDOWS
             ],
         )
