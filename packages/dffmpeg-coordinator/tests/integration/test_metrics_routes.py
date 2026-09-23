@@ -87,6 +87,13 @@ def test_metrics_endpoint_allowed(tmp_path):
         assert 'dffmpeg_job_duration_seconds_sum{window="last_5m"} 0.0' in body
         assert 'dffmpeg_job_duration_seconds_sum{window="current"}' not in body
 
+        # dffmpeg_jobs_by_status: all three terminal statuses always render,
+        # zero-valued with no jobs inserted, across all three windows.
+        assert "# TYPE dffmpeg_jobs_by_status gauge" in body
+        for status in ("completed", "failed", "canceled"):
+            for window in ("current", "last_1m", "last_5m"):
+                assert f'dffmpeg_jobs_by_status{{status="{status}",window="{window}"}} 0' in body
+
 
 def test_metrics_endpoint_forbidden(tmp_path):
     config = get_test_config(True, str(tmp_path / "test.db"))
@@ -317,3 +324,41 @@ async def test_metrics_succeeded_render_format(test_app):
                 'dffmpeg_jobs_succeeded{window="last_1m"} 0',
                 'dffmpeg_jobs_succeeded{window="last_5m"} 0',
             ]
+
+
+@pytest.mark.anyio
+async def test_metrics_canceled_job_lands_in_by_status_not_succeeded(test_app):
+    """
+    The whole point of dffmpeg_jobs_by_status: a canceled job must be visible
+    as status="canceled" there, and must NOT be counted by
+    dffmpeg_jobs_succeeded -- which is completed-only and cannot distinguish a
+    healthy client-driven cancel from a worker failure.
+    """
+    async with test_app.router.lifespan_context(test_app):
+        now = datetime.now(timezone.utc)
+        await _insert_job(
+            test_app,
+            status="canceled",
+            created_at=now - timedelta(seconds=30),
+            last_update=now - timedelta(seconds=10),
+        )
+
+        transport = ASGITransport(app=test_app)
+        async with AsyncClient(transport=transport, base_url="http://test") as client:
+            response = await client.get("/metrics", headers={"X-Forwarded-For": "127.0.0.1"})
+            assert response.status_code == 200
+            body = response.text
+
+            # Lands in dffmpeg_jobs_by_status{status="canceled"} in both windows
+            # it falls inside (current is never set for a terminal status).
+            assert 'dffmpeg_jobs_by_status{status="canceled",window="last_1m"} 1' in body
+            assert 'dffmpeg_jobs_by_status{status="canceled",window="last_5m"} 1' in body
+            assert 'dffmpeg_jobs_by_status{status="canceled",window="current"} 0' in body
+
+            # Does NOT land in dffmpeg_jobs_succeeded (completed-only).
+            assert 'dffmpeg_jobs_succeeded{window="last_1m"} 0' in body
+            assert 'dffmpeg_jobs_succeeded{window="last_5m"} 0' in body
+
+            # Sanity: the other two terminal statuses stay at zero.
+            assert 'dffmpeg_jobs_by_status{status="completed",window="last_1m"} 0' in body
+            assert 'dffmpeg_jobs_by_status{status="failed",window="last_1m"} 0' in body
