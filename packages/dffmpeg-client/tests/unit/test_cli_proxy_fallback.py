@@ -313,6 +313,78 @@ def test_proxy_main_failsafe_forces_local_without_attempting_dffmpeg(monkeypatch
     assert client_constructed == []
 
 
+@pytest.mark.parametrize(
+    "argv_tail",
+    [
+        ["-version"],
+        ["-encoders"],
+        ["-decoders"],
+        ["-filters"],
+        ["-hwaccels"],
+        ["-h", "filter=overlay_vaapi"],
+        ["-h", "bsf=hevc_metadata"],
+        ["-buildconf"],
+        ["-L"],
+        ["--help"],
+        [],  # bare `ffmpeg` prints help and exits
+    ],
+)
+def test_proxy_main_answers_informational_invocations_locally(monkeypatch, argv_tail):
+    """
+    JXC-16: capability/informational queries must never be dispatched. Each of
+    these was measured being forwarded as a coordinator job on 2026-09-23,
+    averaging 14.2s, which is what broke Jellyfin's boot.
+    """
+    config = _config(local_ffmpeg_path="/usr/lib/jellyfin-ffmpeg/ffmpeg")
+    exec_calls = []
+    client_constructed = []
+    telemetry_calls = []
+
+    monkeypatch.setattr(sys, "argv", ["ffmpeg"] + argv_tail)
+    monkeypatch.setattr(cli, "load_config", lambda _: config)
+    monkeypatch.setattr(cli, "DFFmpegClient", lambda cfg: client_constructed.append(cfg))
+    monkeypatch.setattr(cli, "_push_telemetry_sync", lambda *a, **kw: telemetry_calls.append((a, kw)))
+
+    def fake_execv(path, full_argv):
+        exec_calls.append((path, list(full_argv)))
+        raise SystemExit(0)
+
+    monkeypatch.setattr(cli.os, "execv", fake_execv)
+
+    with pytest.raises(SystemExit):
+        cli.proxy_main()
+
+    assert exec_calls == [("/usr/lib/jellyfin-ffmpeg/ffmpeg", ["/usr/lib/jellyfin-ffmpeg/ffmpeg"] + argv_tail)]
+    # The coordinator must never be contacted...
+    assert client_constructed == []
+    # ...and no telemetry push either: it is a network round-trip on the exact
+    # path whose cost is the bug, and it would clobber the last-invocation gauge.
+    assert telemetry_calls == []
+
+
+@pytest.mark.parametrize(
+    "argv_tail",
+    [
+        ["-i", "in.mp4", "out.m3u8"],
+        # -hide_banner is a modifier, NOT an informational flag: real transcode
+        # jobs carry it and must still be dispatched.
+        ["-hide_banner", "-f", "lavfi", "-i", "nullsrc=s=1x1:d=10000", "-f", "null", "-"],
+    ],
+)
+def test_carve_out_does_not_swallow_real_transcodes(argv_tail):
+    """The carve-out must not swallow actual work."""
+    assert cli._is_informational_invocation(argv_tail) is False
+
+
+def test_informational_flags_are_presence_matched_not_position_matched():
+    """
+    ffmpeg honours the first print-and-exit option it sees and ignores the rest
+    of the command line, so position must not matter.
+    """
+    assert cli._is_informational_invocation(["-hide_banner", "-encoders"]) is True
+    assert cli._is_informational_invocation(["-loglevel", "quiet", "-version"]) is True
+
+
 def test_proxy_main_falls_back_on_coordinator_unreachable(monkeypatch):
     config = _config(coordinator_request_timeout=5.0)
     fake_client = _FakeAsyncClient(config)

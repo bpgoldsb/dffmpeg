@@ -41,6 +41,68 @@ logger = logging.getLogger(__name__)
 NO_WORKERS_ONLINE_STATUS = 503
 NO_WORKERS_ONLINE_ERROR_CODE = "no_workers_online"
 
+# ffmpeg options that make ffmpeg print something and exit WITHOUT transcoding.
+# Forwarding one of these to a worker is pure overhead: the answer describes the
+# binary being asked, every worker runs the same pinned jellyfin-ffmpeg build as
+# the local one, and nothing is produced that the caller could not get locally in
+# microseconds.
+#
+# This exists because forwarding them was measured as an outage. Jellyfin's
+# MediaEncoder startup validation issues ~10 of these per boot (-version,
+# -encoders, -decoders, -filters, -hwaccels, plus a `-h filter=<name>` /
+# `-h bsf=<name>` probe per acceleration filter it considers). Dispatched as
+# coordinator jobs on 2026-09-23 they averaged 14.2s each and 64 of 99 never
+# completed at all -- ~142s of startup against an ~80s liveness deadline, so the
+# server could never finish booting. See the homelab plan
+# `dffmpeg-lxc-to-k8s-orgrim-migration`, follow-up F45.
+#
+# Presence-matched, not position-matched: ffmpeg honours the first of these it
+# sees and exits, ignoring the rest of the command line, so an invocation
+# containing any of them can never be a transcode. `-hide_banner` is
+# deliberately ABSENT -- it is a modifier, and real transcode jobs carry it.
+INFORMATIONAL_FLAGS = frozenset(
+    {
+        "-version",
+        "-buildconf",
+        "-license",
+        "-licenses",
+        "-L",
+        "-formats",
+        "-muxers",
+        "-demuxers",
+        "-devices",
+        "-codecs",
+        "-decoders",
+        "-encoders",
+        "-bsfs",
+        "-protocols",
+        "-filters",
+        "-pix_fmts",
+        "-sample_fmts",
+        "-layouts",
+        "-dispositions",
+        "-colors",
+        "-hwaccels",
+        "-h",
+        "-?",
+        "-help",
+        "--help",
+    }
+)
+
+
+def _is_informational_invocation(job_args: List[str]) -> bool:
+    """
+    True when this invocation only asks the binary to describe itself (spec
+    JXC-16) and so must be answered by the local binary rather than dispatched.
+
+    A bare invocation with no arguments counts: ffmpeg prints its help banner
+    and exits, which is equally pointless to forward.
+    """
+    if not job_args:
+        return True
+    return any(arg in INFORMATIONAL_FLAGS for arg in job_args)
+
 
 class PreOutputFailure(Exception):
     """
@@ -524,6 +586,16 @@ def proxy_main():
     script on purpose -- that script has zero error handling and every branch
     ends in a bare `exec`.
 
+    Informational invocations (spec JXC-16) are checked FIRST, ahead of the
+    failsafe, because the question is what kind of invocation this is rather
+    than what the routing policy currently says -- a `-version` is never worth
+    dispatching under any policy. They exec locally with NO telemetry push, and
+    that omission is deliberate on two counts: `dffmpeg_client_last_invocation_path`
+    is a *last*-invocation gauge, so ~10 capability probes at Jellyfin boot would
+    clobber it and hide how real transcodes were actually routed; and the push
+    itself is a network round-trip bounded by `telemetry_timeout`, which would
+    reintroduce a per-probe cost on the exact path whose cost is the bug.
+
     On the dffmpeg path, a pre-output failure (coordinator unreachable, no
     worker online, or the coordinator request timing out -- spec JXC-5,
     JXC-13, JXC-14) falls back to the local binary for this same invocation,
@@ -540,6 +612,11 @@ def proxy_main():
     except Exception as e:
         logger.error(f"Configuration error: {e}")
         sys.exit(1)
+
+    if _is_informational_invocation(job_args):
+        logger.debug("informational invocation; answering from the local binary without dispatching")
+        _exec_local(config, job_args)
+        return  # pragma: no cover - _exec_local never returns on success
 
     if config.failsafe_force_local:
         logger.warning("dffmpeg failsafe (failsafe_force_local) is set; routing directly to local ffmpeg")
