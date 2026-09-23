@@ -386,12 +386,11 @@ class JobMetricsResponse(BaseModel):
     per_worker: Dict[str, MetricCounts]
     # Job counts broken down by terminal status (completed/failed/canceled --
     # see terminal_statuses in metrics.py), seeded the same way per_binary/
-    # per_worker are seeded so all three always render even at zero. Unlike
-    # per_binary/per_worker, a key here can never accumulate a nonzero
-    # `current` count -- reaching one of these three statuses is exactly what
-    # makes a job non-current -- but the field still carries all of MetricCounts
-    # (not just last_1m/last_5m) to keep the by-X shape identical to
-    # per_binary/per_worker.
+    # per_worker are seeded so all three always render even at zero. This
+    # family is terminal-only by construction, so -- like `succeeded` below --
+    # only `last_1m`/`last_5m` are ever populated; `current` is intentionally
+    # left at its default of 0 and never rendered, since reaching one of these
+    # three statuses is exactly what makes a job non-current.
     per_status: Dict[str, MetricCounts]
     # Success-only tally (job.status == "completed"), keyed on job.last_update.
     # Only `last_1m`/`last_5m` are ever populated -- `current` is intentionally left
