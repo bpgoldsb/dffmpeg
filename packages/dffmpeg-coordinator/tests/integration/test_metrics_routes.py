@@ -88,11 +88,13 @@ def test_metrics_endpoint_allowed(tmp_path):
         assert 'dffmpeg_job_duration_seconds_sum{window="current"}' not in body
 
         # dffmpeg_jobs_by_status: all three terminal statuses always render,
-        # zero-valued with no jobs inserted, across all three windows.
+        # zero-valued with no jobs inserted, across last_1m/last_5m only -- no
+        # "current" window, same as dffmpeg_jobs_succeeded.
         assert "# TYPE dffmpeg_jobs_by_status gauge" in body
         for status in ("completed", "failed", "canceled"):
-            for window in ("current", "last_1m", "last_5m"):
+            for window in ("last_1m", "last_5m"):
                 assert f'dffmpeg_jobs_by_status{{status="{status}",window="{window}"}} 0' in body
+            assert f'dffmpeg_jobs_by_status{{status="{status}",window="current"}}' not in body
 
 
 def test_metrics_endpoint_forbidden(tmp_path):
@@ -350,10 +352,11 @@ async def test_metrics_canceled_job_lands_in_by_status_not_succeeded(test_app):
             body = response.text
 
             # Lands in dffmpeg_jobs_by_status{status="canceled"} in both windows
-            # it falls inside (current is never set for a terminal status).
+            # it falls inside. No "current" sample is emitted at all for this
+            # family -- terminal-only, same as dffmpeg_jobs_succeeded.
             assert 'dffmpeg_jobs_by_status{status="canceled",window="last_1m"} 1' in body
             assert 'dffmpeg_jobs_by_status{status="canceled",window="last_5m"} 1' in body
-            assert 'dffmpeg_jobs_by_status{status="canceled",window="current"} 0' in body
+            assert 'dffmpeg_jobs_by_status{status="canceled",window="current"}' not in body
 
             # Does NOT land in dffmpeg_jobs_succeeded (completed-only).
             assert 'dffmpeg_jobs_succeeded{window="last_1m"} 0' in body

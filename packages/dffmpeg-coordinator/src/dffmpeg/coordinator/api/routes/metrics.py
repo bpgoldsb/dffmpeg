@@ -163,15 +163,14 @@ async def get_metrics(
         # Tally per (terminal) status. A non-terminal job (pending/assigned/
         # running/canceling) contributes to none of these keys -- only the three
         # seeded above are ever populated, so `dffmpeg_jobs_by_status` never grows
-        # an unbounded label set. `is_current` is included for structural parity
-        # with the per_binary/per_worker blocks above, but it is always False
-        # here: is_current == not is_terminal, and this branch only runs when
-        # job.status IS terminal, so every status="..." ,window="current" sample
-        # in the rendered family is permanently 0 -- expected, not a bug.
+        # an unbounded label set. No `is_current` branch here, and only
+        # last_1m/last_5m are seeded (_SUCCESS_WINDOWS, not _WINDOWS): this
+        # family is terminal-only by construction (is_current == not is_terminal,
+        # and this block only runs when job.status IS terminal), so a "current"
+        # sample would be permanently zero -- same reasoning as
+        # dffmpeg_jobs_succeeded / dffmpeg_job_duration_seconds_sum above.
         if job.status in terminal_statuses:
             s = job.status
-            if is_current:
-                metrics.per_status[s].current += 1
             if is_1m:
                 metrics.per_status[s].last_1m += 1
             if is_5m:
@@ -293,16 +292,15 @@ async def get_metrics(
             "healthy) from one whose jobs are failing (broken) -- neither is visible "
             "in dffmpeg_jobs_succeeded, which only tracks status=completed. All "
             "three statuses always render, zero-valued if unseen, same as "
-            "dffmpeg_jobs_by_binary/_by_worker. The 'current' window is always 0 "
-            "for every status here: reaching one of these three IS what makes a job "
-            "non-current, so that sample can never be nonzero -- it is rendered "
-            "anyway only to keep the window set identical to the other by-X "
-            "families above.",
+            "dffmpeg_jobs_by_binary/_by_worker. No 'current' window is emitted -- "
+            "same reasoning as dffmpeg_jobs_succeeded: this family is terminal-only "
+            "by construction, so a 'current' sample would be permanently zero, "
+            "which is worse than no series at all for a future `== 0` alert.",
             "gauge",
             [
                 ({"status": status, "window": window}, getattr(counts, window))
                 for status, counts in metrics.per_status.items()
-                for window in _WINDOWS
+                for window in _SUCCESS_WINDOWS
             ],
         )
     )
