@@ -7,6 +7,7 @@ import sys
 from dffmpeg.common.cli_utils import add_config_arg
 from dffmpeg.common.version import get_package_version
 from dffmpeg.worker.config import load_config
+from dffmpeg.worker.metrics import MetricsServer
 from dffmpeg.worker.worker import Worker
 
 logging.basicConfig(level=logging.INFO)
@@ -15,6 +16,15 @@ logger = logging.getLogger(__name__)
 
 async def run_worker(config):
     worker = Worker(config)
+
+    # Started before the worker so the endpoint is already answering by the
+    # time the first job can land, and stopped last so a scrape racing
+    # shutdown still gets the final counts. A bind failure is non-fatal
+    # (metrics.py swallows it) -- observability must not gate transcoding.
+    metrics_server = None
+    if config.metrics.enabled:
+        metrics_server = MetricsServer(config.metrics.host, config.metrics.port)
+        await metrics_server.start()
 
     # Handle shutdown signals
     loop = asyncio.get_running_loop()
@@ -66,6 +76,10 @@ async def run_worker(config):
 
     except Exception as e:
         logger.error(f"Worker runtime error: {e}", exc_info=True)
+
+    finally:
+        if metrics_server is not None:
+            await metrics_server.stop()
 
 
 def main():
