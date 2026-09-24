@@ -10,10 +10,10 @@ built on it is confounded in both directions and can sit permanently unable
 to fire. The worker is the one process that holds the real ffmpeg argv, so it
 is the only place the question can be answered directly instead of inferred.
 
-WHAT IS EXPORTED. One counter family, incremented once per *successfully
-completed* job that actually encoded video:
+WHAT IS EXPORTED. One counter family, incremented once per job that selected
+a video encoder, whatever became of it:
 
-    dffmpeg_worker_jobs_by_encoder_total{encoder="h264_vaapi",accel="hardware"}
+    dffmpeg_worker_jobs_by_encoder_total{encoder="h264_vaapi",accel="hardware",outcome="canceled"}
 
 ``accel`` is the label alerts should key on -- it is derived from the encoder
 name's suffix, so a VAAPI/QSV/NVENC encoder this module has never heard of
@@ -21,10 +21,23 @@ still classifies as ``hardware`` rather than being miscounted as software.
 ``encoder`` is clamped to a known allow-list (else ``other``) so a malformed
 or adversarial argv cannot mint unbounded label values.
 
-Only completed (exit code 0) jobs count. A failed or canceled job says
-nothing about which encoder *works* -- it is the completed-with-software case
-that means "hardware offload regressed", and mixing outcomes into one counter
-would blur exactly the distinction the alert needs.
+WHY ``outcome`` EXISTS, AND WHY CANCELED JOBS COUNT. The obvious design --
+count only clean exits -- was tried first and is wrong here. Real traffic is
+~68 jobs/10h of which ~65 are HLS client-aborts and only ~3 complete: a
+counter gated on exit code 0 would discard roughly 95% of the evidence and
+leave the downstream alert too starved to fire. That is the same shape as the
+confounded-gauge bug this module was written to replace, arrived at from the
+other direction, so it is called out here rather than left as a footnote.
+
+A canceled job is strong evidence, not weak: ffmpeg had selected its encoder
+and was running when the viewer stopped watching. What this counter actually
+measures is *which encoder the job's ffmpeg command line selected*, which is
+precisely the thing a HardwareAccelerationType regression changes. Alerts
+should read ``outcome!="failed"`` -- the encoder was chosen and ran without
+erroring out. ``failed`` is broken out rather than dropped because a VAAPI
+path that errors is a different fault with its own coverage
+(DffmpegWorkerDispatchedAndFailing), and folding it in would let a
+hard-failing hardware encode read as a healthy one.
 
 Deliberately no ``prometheus_client`` dependency and no web framework: the
 exposition format is a handful of lines (the coordinator hand-renders it the
@@ -44,8 +57,9 @@ PROMETHEUS_CONTENT_TYPE = "text/plain; version=0.0.4; charset=utf-8"
 
 _METRIC_NAME = "dffmpeg_worker_jobs_by_encoder_total"
 _METRIC_HELP = (
-    "Completed dffmpeg jobs by the video encoder their ffmpeg command line actually used. "
-    "accel is derived from the encoder name: hardware, software, or none (stream copy)."
+    "dffmpeg jobs by the video encoder their ffmpeg command line selected. accel is derived "
+    "from the encoder name: hardware, software, or none (stream copy). outcome is completed, "
+    "canceled (client aborted mid-encode -- the majority of real traffic) or failed."
 )
 
 # Matches the ffmpeg options that set the VIDEO encoder, and only those:
@@ -115,6 +129,11 @@ _KNOWN_ENCODERS = frozenset(
 ACCEL_HARDWARE = "hardware"
 ACCEL_SOFTWARE = "software"
 ACCEL_NONE = "none"
+
+OUTCOME_COMPLETED = "completed"
+OUTCOME_CANCELED = "canceled"
+OUTCOME_FAILED = "failed"
+OUTCOMES = frozenset({OUTCOME_COMPLETED, OUTCOME_CANCELED, OUTCOME_FAILED})
 
 
 def classify_encoder(encoder: str) -> Tuple[str, str]:
@@ -193,26 +212,29 @@ class EncoderMetrics:
     """
 
     def __init__(self) -> None:
-        # (encoder label, accel label) -> count
+        # (encoder label, accel label, outcome) -> count
         self._counts: Dict[Tuple[str, str], int] = {}
 
-    def record_job(self, binary_path: str, arguments: Sequence[str], exit_code: int) -> None:
+    def record_job(self, binary_path: str, arguments: Sequence[str], outcome: str) -> None:
         """
         Records one finished job, if it is one this counter is about.
 
-        Ignores anything that did not complete cleanly, anything that is not
-        ffmpeg, and anything whose command line encodes no video -- see the
-        module docstring for why each of those is an exclusion rather than a
-        bucket.
+        Ignores anything that is not ffmpeg and anything whose command line
+        encodes no video (an audio-only transcode, an ffprobe-shaped
+        invocation, a capability query) -- those say nothing about video
+        offload. Every other terminal outcome is counted and labeled; see the
+        module docstring for why canceled jobs are the majority of the signal
+        rather than noise to be filtered out.
 
         Args:
             binary_path (str): The binary the executor ran, e.g.
                 "/usr/lib/jellyfin-ffmpeg/ffmpeg".
             arguments (Sequence[str]): The resolved arguments, as executed.
-            exit_code (int): The process exit code.
+            outcome (str): One of OUTCOMES -- "completed", "canceled" or
+                "failed". An unrecognized value is recorded as "failed", so a
+                caller bug degrades toward the bucket alerts ignore rather
+                than inventing a label value.
         """
-        if exit_code != 0:
-            return
         if not binary_path.rsplit("/", 1)[-1].startswith("ffmpeg"):
             return
 
@@ -220,14 +242,19 @@ class EncoderMetrics:
         if encoder is None:
             return
 
-        key = classify_encoder(encoder)
+        if outcome not in OUTCOMES:
+            logger.warning(f"Unrecognized job outcome {outcome!r}, recording as failed")
+            outcome = OUTCOME_FAILED
+
+        enc_label, accel = classify_encoder(encoder)
+        key = (enc_label, accel, outcome)
         self._counts[key] = self._counts.get(key, 0) + 1
-        logger.info(f"Recorded completed job: encoder={key[0]} accel={key[1]}")
+        logger.info(f"Recorded job: encoder={enc_label} accel={accel} outcome={outcome}")
 
     def samples(self) -> Iterable[Tuple[Dict[str, str], int]]:
         """Returns the current (labels, value) pairs, in a stable order."""
-        for (encoder, accel), value in sorted(self._counts.items()):
-            yield {"encoder": encoder, "accel": accel}, value
+        for (encoder, accel, outcome), value in sorted(self._counts.items()):
+            yield {"encoder": encoder, "accel": accel, "outcome": outcome}, value
 
     def render(self) -> str:
         """Renders the counter family in Prometheus text exposition format 0.0.4."""

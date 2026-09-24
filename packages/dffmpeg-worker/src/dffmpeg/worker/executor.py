@@ -5,7 +5,7 @@ from typing import Awaitable, Callable, Dict, List, Optional, Protocol
 from dffmpeg.common.models import LogEntry
 from dffmpeg.common.paths import resolve_arguments, resolve_path
 from dffmpeg.common.stdio_stream_handler import StdioHandler
-from dffmpeg.worker.metrics import METRICS
+from dffmpeg.worker import metrics as worker_metrics
 
 logger = logging.getLogger(__name__)
 
@@ -87,6 +87,16 @@ class SubprocessJobExecutor:
             binary_callback=None,
         )
 
+        # Which video encoder this job selected is recorded in the finally
+        # block below (see metrics.py). Here rather than in JobRunner because
+        # this is the only place holding both the resolved argv and how the
+        # process ended -- and in `finally` specifically because a CANCELED
+        # job must still be counted: client aborts are ~95% of real traffic,
+        # and ffmpeg had already chosen and started its encoder when the
+        # viewer stopped watching. Defaults to "failed" so any unforeseen exit
+        # path lands in the bucket alerts ignore rather than a bogus one.
+        outcome = worker_metrics.OUTCOME_FAILED
+
         try:
             await asyncio.gather(
                 stdout_reader.read_loop(),
@@ -94,20 +104,17 @@ class SubprocessJobExecutor:
             )
 
             return_code = await process.wait()
-
-            # Record which video encoder this job actually used (see
-            # metrics.py). Here rather than in JobRunner because this is the
-            # only place that holds both the resolved argv and the exit code,
-            # and it must not be reachable on the CancelledError path -- a
-            # canceled job never finished choosing anything.
-            METRICS.record_job(self.binary_path, self.resolved_arguments, return_code)
+            outcome = worker_metrics.OUTCOME_COMPLETED if return_code == 0 else worker_metrics.OUTCOME_FAILED
 
             return return_code
 
         except asyncio.CancelledError:
+            outcome = worker_metrics.OUTCOME_CANCELED
             logger.warning(f"Job {self.job_id} canceled, terminating subprocess...")
             raise
         finally:
+            worker_metrics.METRICS.record_job(self.binary_path, self.resolved_arguments, outcome)
+
             if process.returncode is None:
                 try:
                     process.terminate()
