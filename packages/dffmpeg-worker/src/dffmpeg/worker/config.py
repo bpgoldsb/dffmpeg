@@ -26,6 +26,21 @@ class MountManagementConfig(BaseModel):
     mounts: list[str | MountConfig] = Field(default_factory=list)
 
 
+class MetricsConfig(BaseModel):
+    """
+    The worker's own Prometheus endpoint (dffmpeg.worker.metrics).
+
+    Defaults to ON: the offload-regression alert this endpoint feeds is
+    worthless if it silently depends on an opt-in that a worker can be
+    deployed without. Bind host/port are configurable for the LXC substrate,
+    where several services may share a host's network namespace.
+    """
+
+    enabled: bool = True
+    host: str = "0.0.0.0"
+    port: int = 8001
+
+
 class WorkerConfig(BaseModel):
     client_id: str
     hmac_key: str | None = None
@@ -41,6 +56,7 @@ class WorkerConfig(BaseModel):
     binaries: dict[str, str] = Field(default_factory=dict)
     paths: dict[str, str] = Field(default_factory=dict)
     mount_management: MountManagementConfig = Field(default_factory=MountManagementConfig)
+    metrics: MetricsConfig = Field(default_factory=MetricsConfig)
 
 
 def load_config(path: Path | str | None = None) -> WorkerConfig:

@@ -5,6 +5,7 @@ from typing import Awaitable, Callable, Dict, List, Optional, Protocol
 from dffmpeg.common.models import LogEntry
 from dffmpeg.common.paths import resolve_arguments, resolve_path
 from dffmpeg.common.stdio_stream_handler import StdioHandler
+from dffmpeg.worker.metrics import METRICS
 
 logger = logging.getLogger(__name__)
 
@@ -93,6 +94,13 @@ class SubprocessJobExecutor:
             )
 
             return_code = await process.wait()
+
+            # Record which video encoder this job actually used (see
+            # metrics.py). Here rather than in JobRunner because this is the
+            # only place that holds both the resolved argv and the exit code,
+            # and it must not be reachable on the CancelledError path -- a
+            # canceled job never finished choosing anything.
+            METRICS.record_job(self.binary_path, self.resolved_arguments, return_code)
 
             return return_code
 
