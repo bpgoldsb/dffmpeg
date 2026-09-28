@@ -2,7 +2,7 @@ from typing import Any, Dict, Iterable, Optional, Tuple, Union
 
 from sqlalchemy import Table
 from sqlalchemy.engine.interfaces import Dialect
-from sqlalchemy.schema import CreateTable
+from sqlalchemy.schema import CreateIndex, CreateTable
 from sqlalchemy.sql import ClauseElement
 
 from dffmpeg.coordinator.db.engines import BaseDB
@@ -66,6 +66,17 @@ class SQLAlchemyDB(BaseDB):
         Generates the CREATE TABLE statement using self.table (expected from Repo).
         """
         return str(CreateTable(self.table, if_not_exists=True).compile(dialect=self.dialect))
+
+    @property
+    def index_creates(self) -> list[str]:
+        """
+        Generates CREATE INDEX IF NOT EXISTS statements for every index on self.table.
+        CreateTable does not emit indexes, so without these a declared index never exists.
+        """
+        return [
+            str(CreateIndex(index, if_not_exists=True).compile(dialect=self.dialect))
+            for index in sorted(self.table.indexes, key=lambda i: i.name or "")
+        ]
 
     async def execute(self, query: str, params: Optional[Iterable[Any]] = None) -> None:
         raise NotImplementedError()

@@ -100,8 +100,9 @@ async def test_stream_loop_messages(transport, identity, mock_app):
         payload=JobRequestPayload(job_id=str(ULID()), binary_name="ffmpeg", arguments=[], paths=[]),
     )
 
-    # Set up retrieve_messages to return the message on the first call, and empty on subsequent calls
-    mock_app.state.db.messages.retrieve_messages.side_effect = [[msg], []]
+    # Set up retrieve_messages to return the message on the first call, and empty on subsequent calls.
+    # After a batch the loop re-queries immediately (results are paged) before it waits.
+    mock_app.state.db.messages.retrieve_messages.side_effect = [[msg], [], []]
 
     generator = transport._stream_loop(identity, wait=0.1)
 
@@ -120,6 +121,35 @@ async def test_stream_loop_messages(transport, identity, mock_app):
     await transport.drain()
     with pytest.raises(StopAsyncIteration):
         await generator.__anext__()
+
+
+@pytest.mark.asyncio
+async def test_stream_loop_drains_pages_without_waiting(transport, identity, mock_app):
+    """
+    Test that _stream_loop fetches the next page immediately instead of waiting a keepalive interval.
+    """
+
+    def _msg():
+        return JobRequestMessage(
+            recipient_id=identity.client_id,
+            job_id=ULID(),
+            payload=JobRequestPayload(job_id=str(ULID()), binary_name="ffmpeg", arguments=[], paths=[]),
+        )
+
+    page1, page2 = [_msg()], [_msg()]
+    mock_app.state.db.messages.retrieve_messages.side_effect = [page1, page2, [], []]
+
+    # A long keepalive interval: if the loop waited between pages, the second page would time out.
+    generator = transport._stream_loop(identity, wait=30)
+
+    line1 = await asyncio.wait_for(generator.__anext__(), timeout=1)
+    line2 = await asyncio.wait_for(generator.__anext__(), timeout=1)
+    assert json.loads(line1)["messages"][0]["message_id"] == str(page1[0].message_id)
+    assert json.loads(line2)["messages"][0]["message_id"] == str(page2[0].message_id)
+    assert mock_app.state.db.messages.retrieve_messages.call_args.kwargs["last_message_id"] == page1[0].message_id
+
+    await transport.drain()
+    await generator.aclose()
 
 
 @pytest.mark.asyncio

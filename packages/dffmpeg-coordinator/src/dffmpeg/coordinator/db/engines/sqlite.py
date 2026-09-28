@@ -45,9 +45,11 @@ class SQLiteDB(SQLAlchemyDB):
 
     async def setup(self):
         """
-        Initializes the database by creating the table if it doesn't exist.
+        Initializes the database by creating the table and its indexes if they don't exist.
         """
         await self.execute(self.table_create)
+        for index_create in self.index_creates:
+            await self.execute(index_create)
 
     async def get_rows(self, query: str, params: Optional[Iterable[sql_types]] = None) -> Iterable[Dict[str, Any]]:
         """
