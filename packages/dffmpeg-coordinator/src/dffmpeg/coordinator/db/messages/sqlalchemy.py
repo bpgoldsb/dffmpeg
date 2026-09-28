@@ -1,5 +1,5 @@
 import json
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from typing import List, Optional
 
 from pydantic import TypeAdapter
@@ -13,6 +13,9 @@ from dffmpeg.coordinator.db.messages import MessageRepository
 
 
 class SQLAlchemyMessageRepository(MessageRepository, SQLAlchemyDB):
+    POLL_PAGE_SIZE = 100
+    UNSENT_MAX_AGE_SECONDS = 300
+
     async def add_message(self, message: BaseMessage):
         query = self.table.insert().values(
             message_id=str(message.message_id),
@@ -55,11 +58,23 @@ class SQLAlchemyMessageRepository(MessageRepository, SQLAlchemyDB):
 
         if last_message_id is None:
             query = query.where(self.table.c.sent_at.is_(None))
+            if job_id is None:
+                # A fresh connection adopts the newest message it receives as its cursor. An
+                # orphan left undelivered by a previous connection would drag that cursor days
+                # into the past and make the next poll replay everything since. Anything
+                # recipient-level this old is dead anyway (assignment times out in seconds).
+                cutoff = datetime.now(timezone.utc) - timedelta(seconds=self.UNSENT_MAX_AGE_SECONDS)
+                query = query.where(self.table.c.message_id >= str(ULID.from_datetime(cutoff)))
         else:
             query = query.where(self.table.c.message_id > str(last_message_id))
 
         if job_id is not None:
             query = query.where(self.table.c.job_id == str(job_id))
+
+        # Ordered so the caller's cursor (the last message) is the highest ID returned, and
+        # bounded so a long backlog is paged through instead of built into one response too
+        # slow to finish before the poller's read timeout.
+        query = query.order_by(self.table.c.message_id.asc()).limit(self.POLL_PAGE_SIZE)
 
         sql, params = self.compile_query(query)
         rows = await self.get_rows(sql, params)

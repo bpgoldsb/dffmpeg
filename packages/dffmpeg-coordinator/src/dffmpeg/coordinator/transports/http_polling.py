@@ -336,6 +336,10 @@ class HTTPPollingTransport(BaseServerTransport):
                 if self._draining:
                     return
 
+                if messages:
+                    # Results are paged; drain the backlog before waiting for new messages.
+                    continue
+
                 try:
                     await asyncio.wait_for(event.wait(), timeout=wait)
                     event.clear()

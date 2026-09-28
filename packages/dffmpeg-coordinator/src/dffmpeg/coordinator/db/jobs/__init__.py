@@ -24,7 +24,7 @@ class JobRepository(BaseDB):
         Column("arguments", JSON, nullable=False),
         Column("paths", JSON, nullable=False),
         Column("working_directory", String(1024), nullable=True),
-        Column("status", String(50), default="pending"),
+        Column("status", String(50), default="pending", index=True),
         Column("exit_code", Integer, nullable=True),
         Column("worker_id", String(255), ForeignKey("auth.client_id"), nullable=True),
         Column("created_at", TIMESTAMP, server_default=func.current_timestamp()),

@@ -113,6 +113,12 @@ class HTTPPollingClientTransport(BaseClientTransport):
                         await asyncio.sleep(1)
 
             except httpx.ReadTimeout:
+                # The server answers a long-poll within `wait`, so this means it is too slow to
+                # respond at all. Say so: retrying silently hid a days-long poll loop.
+                logger.warning(
+                    f"Poll timed out after {self.poll_wait + 5.0}s waiting for the server "
+                    f"(last_message_id={self._last_message_id}); retrying"
+                )
                 continue
             except asyncio.CancelledError:
                 break

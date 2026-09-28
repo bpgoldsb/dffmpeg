@@ -1,7 +1,7 @@
 from datetime import datetime
 from typing import List, Optional
 
-from sqlalchemy import JSON, TIMESTAMP, Column, ForeignKey, MetaData, String, Table, func
+from sqlalchemy import JSON, TIMESTAMP, Column, ForeignKey, Index, MetaData, String, Table, func
 from ulid import ULID
 
 from dffmpeg.common.models import BaseMessage, Message
@@ -28,6 +28,10 @@ class MessageRepository(BaseDB):
         Column("message_type", String(100), nullable=False),
         Column("payload", JSON, nullable=False),
         Column("sent_at", TIMESTAMP, nullable=True),
+        # Every poll filters on recipient (or job) and pages by message_id; without these
+        # each poll is a full scan of the whole, never-pruned, table.
+        Index("ix_messages_recipient_id_message_id", "recipient_id", "message_id"),
+        Index("ix_messages_job_id_message_id", "job_id", "message_id"),
     )
 
     def __new__(cls, *args, engine: str, **kwargs):
