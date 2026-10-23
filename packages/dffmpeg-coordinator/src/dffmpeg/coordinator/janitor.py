@@ -1,18 +1,23 @@
 import asyncio
 import random
-from datetime import datetime, timezone
+import time
+from datetime import datetime, timedelta, timezone
 from logging import getLogger
 from typing import Optional
 
 from dffmpeg.common.models import JobStatusMessage, JobStatusPayload
 from dffmpeg.coordinator.config import JanitorConfig
 from dffmpeg.coordinator.db.jobs import JobRepository
+from dffmpeg.coordinator.db.messages import MessageRepository
 from dffmpeg.coordinator.db.workers import WorkerRepository
 from dffmpeg.coordinator.scheduler import process_job_assignment
 from dffmpeg.coordinator.stream_storage import StreamStorageManager
 from dffmpeg.coordinator.transports import TransportManager
 
 logger = getLogger(__name__)
+
+MESSAGE_PRUNE_BATCH_SIZE = 5000
+MESSAGE_PRUNE_INTERVAL_SECONDS = 3600
 
 
 class Janitor:
@@ -24,6 +29,7 @@ class Janitor:
         config: JanitorConfig,
         streams: Optional[StreamStorageManager] = None,
         stream_retention_minutes: int = 60,
+        message_repo: Optional[MessageRepository] = None,
     ):
         self.worker_repo = worker_repo
         self.job_repo = job_repo
@@ -31,6 +37,9 @@ class Janitor:
         self.config = config
         self.streams = streams
         self.stream_retention_minutes = stream_retention_minutes
+        self.message_repo = message_repo
+        self._message_prune_cursor: Optional[str] = None
+        self._next_message_prune = 0.0
         self.running = False
         self._queue = None
         self._worker_task = None
@@ -155,6 +164,7 @@ class Janitor:
         await self.reap_pending_jobs()
         await self.reap_abandoned_monitored_jobs()
         await self.reap_stale_streams()
+        await self.reap_old_messages()
 
     async def reap_stale_streams(self):
         """
@@ -325,3 +335,26 @@ class Janitor:
                         payload=JobStatusPayload(status="canceling", last_update=timestamp),
                     )
                     await self.transports.send_message(msg_worker)
+
+    async def reap_old_messages(self):
+        """
+        Deletes one batch of expired messages. After a short batch the next prune waits an hour;
+        after a full batch the next tick continues from the keyset cursor.
+        """
+        if self.message_repo is None or time.monotonic() < self._next_message_prune:
+            return
+
+        full_batch = False
+        try:
+            deleted, last_id = await self.message_repo.delete_expired(
+                message_retention=timedelta(days=self.config.message_retention_days),
+                job_logs_retention=timedelta(days=self.config.job_logs_retention_days),
+                last_message_id=self._message_prune_cursor,
+                batch_size=MESSAGE_PRUNE_BATCH_SIZE,
+            )
+            full_batch = deleted >= MESSAGE_PRUNE_BATCH_SIZE
+            self._message_prune_cursor = last_id if full_batch else None
+            logger.info(f"Pruned {deleted} expired messages.")
+        finally:
+            if not full_batch:
+                self._next_message_prune = time.monotonic() + MESSAGE_PRUNE_INTERVAL_SECONDS

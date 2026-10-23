@@ -95,6 +95,7 @@ async def lifespan(app: FastAPI):
         config=config.janitor,
         streams=app.state.streams,
         stream_retention_minutes=config.stream_retention_minutes,
+        message_repo=app.state.db.messages,
     )
     app.state.janitor = janitor
     await janitor.start()

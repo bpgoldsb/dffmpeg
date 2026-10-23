@@ -1,5 +1,5 @@
-from datetime import datetime
-from typing import List, Optional
+from datetime import datetime, timedelta
+from typing import List, Optional, Tuple
 
 from sqlalchemy import JSON, TIMESTAMP, Column, ForeignKey, Index, MetaData, String, Table, func
 from ulid import ULID
@@ -63,4 +63,17 @@ class MessageRepository(BaseDB):
         raise NotImplementedError()
 
     async def update_message_sent_at(self, message_id: str, sent_at: Optional[datetime] = None) -> None:
+        raise NotImplementedError()
+
+    async def delete_expired(
+        self,
+        message_retention: timedelta,
+        job_logs_retention: timedelta,
+        last_message_id: Optional[str] = None,
+        batch_size: int = 5000,
+    ) -> Tuple[int, Optional[str]]:
+        """
+        Deletes one batch (at most batch_size rows) of expired messages, walking the primary key
+        past last_message_id. Returns (rows deleted, last id selected, or None if nothing matched).
+        """
         raise NotImplementedError()
