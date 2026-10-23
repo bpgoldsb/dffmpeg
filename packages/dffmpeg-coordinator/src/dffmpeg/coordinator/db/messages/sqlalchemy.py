@@ -1,9 +1,9 @@
 import json
 from datetime import datetime, timedelta, timezone
-from typing import List, Optional
+from typing import List, Optional, Tuple
 
 from pydantic import TypeAdapter
-from sqlalchemy import select, update
+from sqlalchemy import delete, or_, select, update
 from ulid import ULID
 
 from dffmpeg.common.formatting import ensure_utc
@@ -128,3 +128,35 @@ class SQLAlchemyMessageRepository(MessageRepository, SQLAlchemyDB):
         query = update(self.table).where(self.table.c.message_id == message_id).values(sent_at=timestamp)
         sql, params = self.compile_query(query)
         await self.execute(sql, params)
+
+    async def delete_expired(
+        self,
+        message_retention: timedelta,
+        job_logs_retention: timedelta,
+        last_message_id: Optional[str] = None,
+        batch_size: int = 5000,
+    ) -> Tuple[int, Optional[str]]:
+        # Age is judged by the time-ordered ULID message_id, so the predicate walks the primary
+        # key (nothing else is indexed by age). Delivered-ness is deliberately not considered.
+        now = datetime.now(timezone.utc)
+        other_cutoff = str(ULID.from_datetime(now - message_retention))
+        logs_cutoff = str(ULID.from_datetime(now - job_logs_retention))
+        col = self.table.c
+        select_query = select(col.message_id).where(
+            col.message_id < other_cutoff,
+            or_(col.message_type != "job_logs", col.message_id < logs_cutoff),
+        )
+        if last_message_id is not None:
+            select_query = select_query.where(col.message_id > last_message_id)
+        select_query = select_query.order_by(col.message_id.asc()).limit(batch_size)
+
+        sql, params = self.compile_query(select_query)
+        rows = await self.get_rows(sql, params)
+        ids = [row["message_id"] for row in rows]
+        if not ids:
+            return 0, None
+
+        # Select-then-delete: MySQL rejects IN (SELECT ... LIMIT).
+        sql, params = self.compile_query(delete(self.table).where(col.message_id.in_(ids)))
+        deleted = await self.execute_and_return_rowcount(sql, params)
+        return deleted, ids[-1]

@@ -135,3 +135,28 @@ def test_mysql_db_ssl_simple_config():
             mock_connect.assert_called_once()
             _, kwargs = mock_connect.call_args
             assert kwargs["ssl"] == mock_ctx_obj
+
+
+@pytest.mark.anyio
+async def test_mysql_message_delete_expired_is_select_then_delete():
+    from datetime import timedelta
+    from unittest.mock import AsyncMock
+
+    from dffmpeg.coordinator.db.messages.mysql import MySQLMessageRepository
+
+    with patch("dffmpeg.coordinator.db.messages.load") as mock_load:
+        mock_load.return_value = MySQLMessageRepository
+        repo = MySQLMessageRepository(
+            host="localhost", port=3306, user="t", password="t", database="d", tablename="messages", engine="mysql"
+        )
+    repo.get_rows = AsyncMock(return_value=[{"message_id": "A"}, {"message_id": "B"}])
+    repo.execute_and_return_rowcount = AsyncMock(return_value=2)
+
+    result = await repo.delete_expired(timedelta(days=2), timedelta(days=14), last_message_id="0", batch_size=5000)
+
+    assert result == (2, "B")
+    select_sql = repo.get_rows.await_args.args[0]
+    delete_sql = repo.execute_and_return_rowcount.await_args.args[0]
+    assert "LIMIT" in select_sql and "ORDER BY" in select_sql and "message_id >" in select_sql
+    assert delete_sql.startswith("DELETE FROM messages WHERE messages.message_id IN (")
+    assert "SELECT" not in delete_sql and "LIMIT" not in delete_sql

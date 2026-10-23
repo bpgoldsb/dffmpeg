@@ -23,6 +23,8 @@ class JanitorConfig(BaseModel):
     job_assignment_timeout: int = 10
     job_pending_retry_delay: int = 5
     job_pending_timeout: int = 30
+    message_retention_days: float = 2
+    job_logs_retention_days: float = 14
 
 
 class CoordinatorConfig(BaseModel):

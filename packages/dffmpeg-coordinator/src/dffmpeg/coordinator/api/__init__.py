@@ -87,6 +87,7 @@ async def lifespan(app: FastAPI):
         job_repo=app.state.db.jobs,
         transports=app.state.transports,
         config=config.janitor,
+        message_repo=app.state.db.messages,
     )
     app.state.janitor = janitor
     await janitor.start()
