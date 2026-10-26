@@ -224,6 +224,31 @@ async def test_reap_abandoned_monitored_jobs(janitor, job_repo, transports):
     assert "worker1" in recipients
 
 
+@pytest.mark.anyio
+async def test_reap_abandoned_monitored_jobs_without_worker_goes_straight_to_canceled(janitor, job_repo, transports):
+    job = JobRecord(
+        job_id=ULID(),
+        requester_id="client1",
+        worker_id=None,
+        binary_name="ffmpeg",
+        status="canceling",
+        monitor=True,
+        transport="http",
+        transport_metadata={},
+    )
+    job_repo.get_stale_monitored_jobs.return_value = [job]
+    job_repo.update_status.return_value = True
+
+    await janitor.reap_abandoned_monitored_jobs()
+
+    job_repo.update_status.assert_called_once_with(job.job_id, "canceled", timestamp=ANY)
+    # Only the client is told; there is no worker to notify.
+    assert transports.send_message.call_count == 1
+    msg = transports.send_message.call_args[0][0]
+    assert msg.recipient_id == "client1"
+    assert msg.payload.status == "canceled"
+
+
 @pytest.fixture
 def message_repo():
     repo = AsyncMock()

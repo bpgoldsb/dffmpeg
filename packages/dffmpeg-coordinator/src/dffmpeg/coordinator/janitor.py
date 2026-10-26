@@ -311,10 +311,13 @@ class Janitor:
             logger.warning(f"Job {job.job_id} client heartbeat timeout. Canceling.")
             timestamp = datetime.now(timezone.utc)
 
-            # Mark as canceled (Terminal state)
+            # A job with no worker has nothing to hand-shake with: go straight to the terminal
+            # state. Otherwise it stays "canceling" (still in the reaper's active set) and is
+            # re-selected and re-notified on every tick, forever.
+            new_status = "canceling" if job.worker_id else "canceled"
             success = await self.job_repo.update_status(
                 job.job_id,
-                "canceling",
+                new_status,
                 timestamp=timestamp,
             )
 
@@ -323,7 +326,7 @@ class Janitor:
                 msg_client = JobStatusMessage(
                     recipient_id=job.requester_id,
                     job_id=job.job_id,
-                    payload=JobStatusPayload(status="canceling", last_update=timestamp),
+                    payload=JobStatusPayload(status=new_status, last_update=timestamp),
                 )
                 await self.transports.send_message(msg_client)
 
